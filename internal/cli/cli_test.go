@@ -14,7 +14,7 @@ func TestVersion(t *testing.T) {
 	if code := app.Run(context.Background(), []string{"version"}); code != 0 {
 		t.Fatalf("unexpected exit code %d: %s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "sshappy-tune 0.1.0") {
+	if !strings.Contains(stdout.String(), "sshappy-tune 0.2.0") {
 		t.Fatalf("unexpected version output: %s", stdout.String())
 	}
 }

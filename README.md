@@ -2,24 +2,30 @@
 
 `sshappy-tune` 是面向 Linux 代理节点的宿主机网络检测与受控调优工具。它与代理后端分离运行，不读取数据库、用户密码、`server_key` 或 API Token，也不要求代理容器获得 `NET_ADMIN`、特权模式或 Docker Socket。
 
-当前版本：`0.1.0`
+当前版本：`0.2.0`
 
 ## 安全边界
 
 默认命令只读取系统状态。实际修改必须使用 root，并显式提供 `--confirm`。
 
-版本 0.1 只管理以下两个文件：
+版本 0.2 管理以下文件：
 
 ```text
 /etc/sysctl.d/99-sshappy-tune.conf
 /etc/modules-load.d/sshappy-tune-bbr.conf
+/etc/sshappy-tune/profile.json
+/etc/systemd/system/sshappy-tune-apply.service
+/etc/systemd/system/sshappy-tune-verify.service
+/etc/systemd/system/sshappy-tune-verify.timer
 ```
 
-工具会在修改前，把自身管理的 sysctl 原值和上述两个文件的原始内容保存到：
+每次应用 TCP 参数前，工具会把自身管理的 sysctl 原值，以及 sysctl/BBR 两个核心文件的原始内容保存到：
 
 ```text
 /var/lib/sshappy-tune/snapshots/<snapshot-id>/snapshot.json
 ```
+
+profile 和三个 systemd unit 使用独立的事务式安装：如果安装中途失败，工具会恢复安装前的文件状态。它们不属于上述 sysctl 回滚快照。
 
 工具不会：
 
@@ -29,7 +35,29 @@
 - 修改防火墙、路由、DNS、MTU、swap 或用户连接限制。
 - 自动启用 HTB 或限制宿主机带宽。
 - 在业务运行期间重建活动 qdisc。
-- 定时或持续自动修改内核参数。
+- 根据短时网络波动持续修改内核参数。
+
+定时器每6小时执行一次只读 `verify`。开机服务只在已确认的 profile、sysctl或自有文件发生漂移时校准；没有漂移就不会写入参数或创建快照。
+
+## 一键安装并启动
+
+一键脚本仅支持带 systemd 的 Linux AMD64/ARM64。它固定下载 `v0.2.0` release，核对 SHA-256 后安装二进制，先输出完整 dry-run，再执行首次校准并启动自动维护：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SadNoo/sshappy-tune/v0.2.0/install.sh \
+  | sudo bash -s -- \
+      --bandwidth 1000 \
+      --rtt 150 \
+      --confirm
+```
+
+其中：
+
+- `--bandwidth` 是节点预期可用带宽，单位 Mbps。
+- `--rtt` 是代表性用户线路 RTT，单位毫秒。
+- `--confirm` 表示允许首次应用持久化 TCP 配置并安装 systemd 服务。
+
+脚本不会安装系统软件包。目标机器需要 `curl`、`sha256sum`、`install`、`ip`、`tc`、`sysctl`、`modprobe` 和 `systemctl`。
 
 ## 构建
 
@@ -88,6 +116,38 @@ sudo ./sshappy-tune apply --bandwidth 1000 --rtt 150 --confirm
 sudo ./sshappy-tune verify
 ```
 
+已经把二进制安装到 `/usr/local/sbin/sshappy-tune` 时，也可以手动安装自动维护：
+
+```bash
+sudo /usr/local/sbin/sshappy-tune service install \
+  --bandwidth 1000 \
+  --rtt 150 \
+  --confirm
+```
+
+查看自动维护状态：
+
+```bash
+/usr/local/sbin/sshappy-tune service status
+systemctl list-timers sshappy-tune-verify.timer
+```
+
+手动使用已保存 profile 进行幂等校准：
+
+```bash
+sudo /usr/local/sbin/sshappy-tune reconcile --confirm
+```
+
+只有检测到 sysctl 或自有持久化文件漂移时，`reconcile` 才会应用并创建回滚快照。
+
+移除自动维护服务和 profile：
+
+```bash
+sudo /usr/local/sbin/sshappy-tune service uninstall --confirm
+```
+
+卸载自动维护不会自动回滚已经生效的 sysctl。需要恢复参数时，应先执行 `rollback --confirm`，再卸载服务。
+
 恢复最近一次修改前的原值和文件：
 
 ```bash
@@ -106,7 +166,7 @@ sudo ./sshappy-tune rollback --snapshot 20260815T010203.000000004Z --confirm
 
 ## 计算规则
 
-版本 0.1 只支持 `proxy` 角色：
+版本 0.2 只支持 `proxy` 角色：
 
 ```text
 BDP = 带宽(Mbps) × RTT(ms) × 125
@@ -124,7 +184,7 @@ BDP = 带宽(Mbps) × RTT(ms) × 125
 - 根 qdisc 为 `fq`。
 - 根 qdisc 为 `mq`，且每个硬件发送队列的叶子均为 `fq`。
 
-`net.core.default_qdisc=fq` 会写入持久化配置，但版本 0.1 不会替换活动 qdisc。这样可以避免把正确的 `mq + fq leaves` 误改成单队列，或破坏宿主机已有的复杂整形规则。`verify` 会对不符合要求的活动 qdisc 给出警告。
+`net.core.default_qdisc=fq` 会写入持久化配置，但工具不会替换活动 qdisc。这样可以避免把正确的 `mq + fq leaves` 误改成单队列，或破坏宿主机已有的复杂整形规则。`verify` 会对不符合要求的活动 qdisc 给出警告。
 
 ## 开发检查
 

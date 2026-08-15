@@ -44,7 +44,7 @@ func Recommend(profile host.Profile, input Input) (Recommendation, error) {
 		input.Role = "proxy"
 	}
 	if input.Role != "proxy" {
-		return Recommendation{}, fmt.Errorf("version 0.1 supports the proxy role only")
+		return Recommendation{}, fmt.Errorf("only the proxy role is supported")
 	}
 	if profile.MemoryMB < 128 {
 		return Recommendation{}, fmt.Errorf("at least 128 MB of detected memory is required")
@@ -101,7 +101,7 @@ func Recommend(profile host.Profile, input Input) (Recommendation, error) {
 		recommendation.Warnings = append(recommendation.Warnings, "requested bandwidth exceeds the reported interface speed")
 	}
 	if !profile.Qdisc.FQReady {
-		recommendation.Warnings = append(recommendation.Warnings, "the active qdisc is not fq-ready; version 0.1 will not rebuild a live qdisc")
+		recommendation.Warnings = append(recommendation.Warnings, "the active qdisc is not fq-ready; sshappy-tune will not rebuild a live qdisc")
 	}
 	return recommendation, nil
 }

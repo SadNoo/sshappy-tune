@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/SadNoo/sshappy-tune/internal/automation"
 	"github.com/SadNoo/sshappy-tune/internal/host"
 	"github.com/SadNoo/sshappy-tune/internal/manage"
 	"github.com/SadNoo/sshappy-tune/internal/runx"
@@ -21,6 +23,7 @@ type App struct {
 	Runner   runx.Runner
 	Detector host.Detector
 	Manager  manage.Manager
+	Services automation.Installer
 	Stdout   io.Writer
 	Stderr   io.Writer
 }
@@ -28,7 +31,7 @@ type App struct {
 func New(stdout, stderr io.Writer) App {
 	runner := runx.ExecRunner{}
 	return App{
-		Runner: runner, Detector: host.NewDetector(runner), Manager: manage.NewManager(runner),
+		Runner: runner, Detector: host.NewDetector(runner), Manager: manage.NewManager(runner), Services: automation.NewInstaller(runner),
 		Stdout: stdout, Stderr: stderr,
 	}
 }
@@ -58,6 +61,10 @@ func (a App) Run(ctx context.Context, args []string) int {
 		err = a.verify(ctx, args[1:])
 	case "rollback":
 		err = a.rollback(ctx, args[1:])
+	case "reconcile":
+		err = a.reconcile(ctx, args[1:])
+	case "service":
+		err = a.service(ctx, args[1:])
 	default:
 		err = fmt.Errorf("unknown command %q", args[0])
 	}
@@ -66,6 +73,13 @@ func (a App) Run(ctx context.Context, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+type ReconcileResult struct {
+	Changed      bool                `json:"changed"`
+	Drift        manage.Drift        `json:"drift"`
+	SnapshotID   string              `json:"snapshotId,omitempty"`
+	Verification manage.Verification `json:"verification"`
 }
 
 func (a App) detect(ctx context.Context, args []string) error {
@@ -218,6 +232,150 @@ func (a App) rollback(ctx context.Context, args []string) error {
 	return nil
 }
 
+func (a App) reconcile(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("reconcile", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	confirm := fs.Bool("confirm", false, "confirm host modification when drift is found")
+	jsonOutput := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("reconcile accepts no positional arguments")
+	}
+	if !*confirm {
+		return fmt.Errorf("refusing to reconcile without --confirm")
+	}
+	profile, err := automation.LoadProfile(a.Services.Paths.ProfileFile)
+	if err != nil {
+		return err
+	}
+	result, err := a.reconcileInput(ctx, profile.Input)
+	if *jsonOutput {
+		if writeErr := writeJSON(a.Stdout, result); writeErr != nil && err == nil {
+			err = writeErr
+		}
+	} else {
+		printReconcile(a.Stdout, result)
+	}
+	return err
+}
+
+func (a App) reconcileInput(ctx context.Context, input tune.Input) (ReconcileResult, error) {
+	hostProfile, recommendation, err := a.buildRecommendation(ctx, input)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	plan := manage.BuildPlan(hostProfile.Sysctls, recommendation)
+	drift, err := a.Manager.NeedsApply(plan)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
+	result := ReconcileResult{Drift: drift}
+	if !drift.Needed {
+		result.Verification, err = a.Manager.Verify(ctx, a.Detector)
+		return result, err
+	}
+	applyResult, err := a.Manager.Apply(ctx, plan)
+	result.Changed = err == nil
+	result.SnapshotID = applyResult.SnapshotID
+	result.Verification = applyResult.Verification
+	return result, err
+}
+
+func (a App) service(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: sshappy-tune service <install|status|uninstall>")
+	}
+	switch args[0] {
+	case "install":
+		return a.serviceInstall(ctx, args[1:])
+	case "status":
+		return a.serviceStatus(ctx, args[1:])
+	case "uninstall":
+		return a.serviceUninstall(ctx, args[1:])
+	default:
+		return fmt.Errorf("unknown service command %q", args[0])
+	}
+}
+
+func (a App) serviceInstall(ctx context.Context, args []string) error {
+	input, jsonOutput, confirm, err := parseServiceInstallFlags(args, a.Stderr)
+	if err != nil {
+		return err
+	}
+	if !confirm {
+		return fmt.Errorf("refusing to install automation without --confirm")
+	}
+	profile := automation.NewProfile(input)
+	if err := a.Services.PreflightInstall(profile); err != nil {
+		return err
+	}
+	result, err := a.reconcileInput(ctx, profile.Input)
+	if err != nil {
+		return err
+	}
+	if err := a.Services.Install(ctx, profile); err != nil {
+		var rollbackErr error
+		if result.Changed && result.SnapshotID != "" {
+			_, rollbackErr = a.Manager.Rollback(ctx, result.SnapshotID)
+		}
+		return errors.Join(err, rollbackErr)
+	}
+	if jsonOutput {
+		return writeJSON(a.Stdout, result)
+	}
+	printReconcile(a.Stdout, result)
+	fmt.Fprintln(a.Stdout, "automationInstalled=true verifyInterval=6h")
+	return nil
+}
+
+func (a App) serviceStatus(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("service status", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	jsonOutput := fs.Bool("json", false, "print JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("service status accepts no positional arguments")
+	}
+	status, err := a.Services.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if *jsonOutput {
+		return writeJSON(a.Stdout, status)
+	}
+	fmt.Fprintf(a.Stdout, "installed=%t applyUnit=%s timerUnit=%s timerActive=%s\n",
+		status.Installed, emptyText(status.ApplyUnitState), emptyText(status.TimerUnitState), emptyText(status.TimerActiveState))
+	if status.Installed {
+		fmt.Fprintf(a.Stdout, "profile role=%s bandwidth=%dMbps rtt=%dms\n",
+			status.Profile.Input.Role, status.Profile.Input.BandwidthMbps, status.Profile.Input.RTTMillis)
+	}
+	return nil
+}
+
+func (a App) serviceUninstall(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("service uninstall", flag.ContinueOnError)
+	fs.SetOutput(a.Stderr)
+	confirm := fs.Bool("confirm", false, "confirm service removal")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("service uninstall accepts no positional arguments")
+	}
+	if !*confirm {
+		return fmt.Errorf("refusing to uninstall automation without --confirm")
+	}
+	if err := a.Services.Uninstall(ctx); err != nil {
+		return err
+	}
+	fmt.Fprintln(a.Stdout, "automationInstalled=false; managed sysctl settings were left unchanged")
+	return nil
+}
+
 func (a App) buildRecommendation(ctx context.Context, input tune.Input) (host.Profile, tune.Recommendation, error) {
 	profile, err := a.Detector.Detect(ctx)
 	if err != nil {
@@ -259,6 +417,23 @@ func parseApplyFlags(args []string, stderr io.Writer) (tune.Input, bool, bool, b
 		return tune.Input{}, false, false, false, fmt.Errorf("unexpected positional arguments")
 	}
 	return tune.Input{BandwidthMbps: *bandwidth, RTTMillis: *rtt, Role: *role}, *jsonOutput, *dryRun, *confirm, nil
+}
+
+func parseServiceInstallFlags(args []string, stderr io.Writer) (tune.Input, bool, bool, error) {
+	fs := flag.NewFlagSet("service install", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	bandwidth := fs.Int64("bandwidth", 0, "expected node bandwidth in Mbps")
+	rtt := fs.Int64("rtt", 0, "representative RTT in milliseconds")
+	role := fs.String("role", "proxy", "workload role (proxy)")
+	jsonOutput := fs.Bool("json", false, "print JSON")
+	confirm := fs.Bool("confirm", false, "confirm service installation and initial reconciliation")
+	if err := fs.Parse(args); err != nil {
+		return tune.Input{}, false, false, err
+	}
+	if fs.NArg() != 0 {
+		return tune.Input{}, false, false, fmt.Errorf("unexpected positional arguments")
+	}
+	return tune.Input{BandwidthMbps: *bandwidth, RTTMillis: *rtt, Role: *role}, *jsonOutput, *confirm, nil
 }
 
 func writeJSON(w io.Writer, value any) error {
@@ -339,6 +514,19 @@ func printVerification(w io.Writer, verification manage.Verification) {
 	fmt.Fprintf(w, "verificationOK=%t\n", verification.OK)
 }
 
+func printReconcile(w io.Writer, result ReconcileResult) {
+	fmt.Fprintf(w, "changed=%t drift=%t\n", result.Changed, result.Drift.Needed)
+	for _, reason := range result.Drift.Reasons {
+		fmt.Fprintf(w, "DRIFT: %s\n", reason)
+	}
+	if result.SnapshotID != "" {
+		fmt.Fprintf(w, "snapshot: %s\n", result.SnapshotID)
+	}
+	if len(result.Verification.Checks) > 0 || len(result.Verification.Warnings) > 0 {
+		printVerification(w, result.Verification)
+	}
+}
+
 func bytesText(value int64) string {
 	return fmt.Sprintf("%.2f MiB (%s bytes)", float64(value)/(1024*1024), strconv.FormatInt(value, 10))
 }
@@ -370,7 +558,11 @@ Usage:
   sshappy-tune apply --bandwidth <Mbps> --rtt <ms> --confirm [--json]
   sshappy-tune verify [--json]
   sshappy-tune rollback [--snapshot <ID>] --confirm [--json]
+  sshappy-tune reconcile --confirm [--json]
+  sshappy-tune service install --bandwidth <Mbps> --rtt <ms> --confirm [--json]
+  sshappy-tune service status [--json]
+  sshappy-tune service uninstall --confirm
   sshappy-tune version
 
-The tool never opens the Docker socket and never rebuilds a live qdisc in version 0.1.`)
+The tool never opens the Docker socket and never rebuilds a live qdisc.`)
 }

@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: "1.24.x"
+          cache: false
+
+      - name: Validate tag and source version
+        run: |
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$(go run ./cmd/sshappy-tune version | awk '{print $2}')"
+          test "${expected}" = "${actual}"
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Validate installer syntax
+        run: bash -n install.sh
+
+      - name: Build release assets
+        run: |
+          mkdir -p dist
+          version="${GITHUB_REF_NAME#v}"
+          build_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-s -w -X github.com/SadNoo/sshappy-tune/internal/version.Version=${version} -X github.com/SadNoo/sshappy-tune/internal/version.Commit=${GITHUB_SHA} -X github.com/SadNoo/sshappy-tune/internal/version.BuildTime=${build_time}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "${ldflags}" -o dist/sshappy-tune-linux-amd64 ./cmd/sshappy-tune
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "${ldflags}" -o dist/sshappy-tune-linux-arm64 ./cmd/sshappy-tune
+          (
+            cd dist
+            sha256sum sshappy-tune-linux-amd64 sshappy-tune-linux-arm64 > checksums.txt
+          )
+          cp install.sh dist/install.sh
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/sshappy-tune-linux-amd64 \
+            dist/sshappy-tune-linux-arm64 \
+            dist/checksums.txt \
+            dist/install.sh \
+            --verify-tag \
+            --title "sshappy-tune ${GITHUB_REF_NAME#v}" \
+            --notes "Linux AMD64/ARM64 release with SHA-256 verified one-click installation and systemd automation."

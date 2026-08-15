@@ -32,6 +32,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Validate installer syntax
+        run: bash -n install.sh
+
       - name: Prepare build output
         run: mkdir -p dist
 

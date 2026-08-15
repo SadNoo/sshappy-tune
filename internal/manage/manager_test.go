@@ -157,6 +157,13 @@ func TestApplyAndRollback(t *testing.T) {
 	if _, err := os.Stat(paths.ModulesFile); err != nil {
 		t.Fatalf("modules file was not written: %v", err)
 	}
+	drift, err := manager.NeedsApply(BuildPlan(expected, recommendation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drift.Needed {
+		t.Fatalf("freshly applied configuration must be idempotent: %+v", drift)
+	}
 
 	if _, err := manager.Rollback(context.Background(), ""); err != nil {
 		t.Fatal(err)

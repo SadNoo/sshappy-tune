@@ -42,6 +42,11 @@ type ApplyResult struct {
 	Verification Verification `json:"verification"`
 }
 
+type Drift struct {
+	Needed  bool     `json:"needed"`
+	Reasons []string `json:"reasons,omitempty"`
+}
+
 type Check struct {
 	Name     string `json:"name"`
 	Expected string `json:"expected"`
@@ -58,6 +63,32 @@ type Verification struct {
 
 func NewManager(runner runx.Runner) Manager {
 	return Manager{Runner: runner, Paths: DefaultPaths(), Now: time.Now, EUID: os.Geteuid}
+}
+
+func (m Manager) NeedsApply(plan Plan) (Drift, error) {
+	if err := m.requireReady(); err != nil {
+		return Drift{}, err
+	}
+	if err := validateManagedSysctls(plan.Recommendation.Sysctls); err != nil {
+		return Drift{}, err
+	}
+	var reasons []string
+	for _, key := range sortedKeys(plan.Changes) {
+		if plan.Changes[key].Changed {
+			reasons = append(reasons, "sysctl drift: "+key)
+		}
+	}
+	if reason, err := fileDrift(m.Paths.SysctlFile, []byte(plan.SysctlConfig)); err != nil {
+		return Drift{}, err
+	} else if reason != "" {
+		reasons = append(reasons, reason)
+	}
+	if reason, err := fileDrift(m.Paths.ModulesFile, []byte("tcp_bbr\n")); err != nil {
+		return Drift{}, err
+	} else if reason != "" {
+		reasons = append(reasons, reason)
+	}
+	return Drift{Needed: len(reasons) > 0, Reasons: reasons}, nil
 }
 
 func (m Manager) Apply(ctx context.Context, plan Plan) (ApplyResult, error) {
@@ -150,7 +181,7 @@ func (m Manager) Verify(ctx context.Context, detector host.Detector) (Verificati
 		verification.OK = false
 	}
 	if !profile.Qdisc.FQReady {
-		verification.Warnings = append(verification.Warnings, "active qdisc is not fq or mq with fq leaves; version 0.1 does not rebuild live qdisc state")
+		verification.Warnings = append(verification.Warnings, "active qdisc is not fq or mq with fq leaves; sshappy-tune does not rebuild live qdisc state")
 	}
 	verification.Warnings = append(verification.Warnings, profile.Warnings...)
 	return verification, nil
@@ -315,4 +346,25 @@ func wordPresent(values, expected string) bool {
 		}
 	}
 	return false
+}
+
+func fileDrift(path string, expected []byte) (string, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return "managed file is missing: " + path, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("managed path is not a regular file: %s", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if string(data) != string(expected) {
+		return "managed file content drift: " + path, nil
+	}
+	return "", nil
 }
