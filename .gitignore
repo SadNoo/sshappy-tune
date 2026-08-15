@@ -1,0 +1,18 @@
+# Local build outputs
+/bin/
+/dist/
+*.test
+*.out
+
+# Local measurements and host-specific data
+/.env
+/local/
+/reports/
+/results/
+/snapshots/
+
+# Private key material
+*.key
+*.pem
+*.p12
+*.pfx
